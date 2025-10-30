@@ -1,0 +1,382 @@
+import os
+import re
+import difflib
+import pandas as pd
+import pandas.api.types as ptypes
+from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.exc import SQLAlchemyError
+from datetime import datetime
+
+# ------------------------
+# DB config (edit if needed)
+# ------------------------
+DB_CONFIG = {
+    "drivername": "postgresql+psycopg2",
+    "username": "postgres",
+    "password": "Volkswagengolf2025",   # <-- keep your password here
+    "host": "localhost",
+    "port": "5433",                    # change to 5432 if that's your port
+    "database": "NML_db"         # change if your DB name differs
+}
+
+DB_URL = (
+    f"{DB_CONFIG['drivername']}://{DB_CONFIG['username']}:{DB_CONFIG['password']}"
+    f"@{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}"
+)
+
+# ------------------------
+# Utilities
+# ------------------------
+def normalize_colname(s):
+    """Sanitise a column name: lowercase, alnum+underscore, no leading digits."""
+    if s is None:
+        return "col"
+    s = str(s)
+    s = s.strip().lower()
+    s = re.sub(r'\s+', '_', s)
+    s = re.sub(r'[^0-9a-zA-Z_]', '', s)
+    s = re.sub(r'_+', '_', s)
+    s = s.strip('_')
+    if re.match(r'^\d', s):
+        s = 'c_' + s
+    if s == "":
+        s = "col"
+    return s
+
+def infer_sql_type(series):
+    """Return a Postgres type guess for a pandas Series."""
+    s = series.dropna()
+    if s.empty:
+        return 'text'
+    # datetime detection
+    if ptypes.is_datetime64_any_dtype(series):
+        return 'timestamp'
+    # numeric detection: if majority numeric, use double precision
+    coerced = pd.to_numeric(series, errors='coerce')
+    if coerced.count() >= max(1, int(0.5 * len(series))):  # at least 50% numeric
+        return 'double precision'
+    # fallback
+    return 'text'
+
+def ensure_table_exists(engine, table_name):
+    """Create minimal table with id serial if it doesn't exist."""
+    inspector = inspect(engine)
+    if table_name in inspector.get_table_names():
+        return
+    with engine.begin() as conn:
+        conn.execute(text(f'CREATE TABLE "{table_name}" (id SERIAL PRIMARY KEY)'))
+    print(f"🛠 Created table {table_name} (minimal).")
+
+def get_db_columns(engine, table_name):
+    inspector = inspect(engine)
+    if table_name not in inspector.get_table_names():
+        return []
+    cols = [c['name'] for c in inspector.get_columns(table_name)]
+    return cols
+
+def ensure_columns_exist(engine, table_name, columns_types):
+    """Add missing columns to table. columns_types: {colname: sql_type}."""
+    inspector = inspect(engine)
+    existing = get_db_columns(engine, table_name)
+    to_add = {c: columns_types[c] for c in columns_types if c not in existing}
+    if not to_add:
+        return []
+    added = []
+    with engine.begin() as conn:
+        for col, coltype in to_add.items():
+            # safe column name (we have already normalised it)
+            sql = f'ALTER TABLE "{table_name}" ADD COLUMN "{col}" {coltype}'
+            conn.execute(text(sql))
+            added.append((col, coltype))
+    if added:
+        print(f"🛠 Added columns to {table_name}: {added}")
+    return added
+
+def insert_metadata_return_id(engine, metadata):
+    """Ensure calibration_metadata exists, add missing columns, insert metadata and return id."""
+    table = "calibration_metadata"
+    ensure_table_exists(engine, table)
+    # normalise metadata keys -> column names
+    norm_meta = {normalize_colname(k): v for k, v in metadata.items() if k is not None}
+    # infer types
+    col_types = {k: ('timestamp' if isinstance(v, (pd.Timestamp, datetime)) else ('double precision' if isinstance(v, (int, float)) else 'text'))
+                 for k,v in norm_meta.items()}
+    ensure_columns_exist(engine, table, col_types)
+    # Prepare and execute INSERT ... RETURNING id
+    cols = list(norm_meta.keys())
+    if not cols:
+        # no metadata to insert - just select last id
+        df = pd.read_sql(f"SELECT id FROM {table} ORDER BY id DESC LIMIT 1", con=engine)
+        if df.empty:
+            return None
+        return int(df.iloc[0,0])
+    col_list_sql = ', '.join(f'"{c}"' for c in cols)
+    param_list_sql = ', '.join(f':{c}' for c in cols)
+    params = {c: norm_meta[c] for c in cols}
+    with engine.begin() as conn:
+        sql = text(f'INSERT INTO "{table}" ({col_list_sql}) VALUES ({param_list_sql}) RETURNING id')
+        res = conn.execute(sql, params)
+        new_id = res.scalar()
+    print(f"🔖 Inserted metadata (id={new_id}) columns: {cols}")
+    return int(new_id)
+
+# ------------------------
+# Excel parsers
+# ------------------------
+def detect_lab_type(file_path):
+    """Detect whether file belongs to F1/E2 or Large Mass lab."""
+    try:
+        xl = pd.ExcelFile(file_path)
+        sheets = [s.lower() for s in xl.sheet_names]
+        if any("f1" in s or "e2" in s for s in sheets):
+            return "F1/E2"
+        elif any("results" in s and "sheet" in s for s in sheets):
+            return "Large Mass"
+        else:
+            return "Unknown"
+    except Exception as e:
+        return "Unreadable"
+
+def find_header_row(df_raw, keywords=('nominal','measured','measurement','uncertainty','deviation','oiml')):
+    """Find header row index by looking for any keyword in a row's text cells. Search first 20 rows."""
+    max_search = min(20, len(df_raw))
+    for idx in range(max_search):
+        row = df_raw.iloc[idx].astype(str).str.lower()
+        for kw in keywords:
+            if row.str.contains(kw, na=False).any():
+                return idx
+    # fallback: choose row with most non-null (text) values in first 20
+    counts = [df_raw.iloc[i].notna().sum() for i in range(max_search)]
+    best = int(pd.Series(counts).idxmax()) if counts else None
+    return best
+
+def extract_measurements(file_path, lab_type):
+    """Robust extraction & cleaning of measurement data from the relevant sheet."""
+    try:
+        if lab_type == "F1/E2":
+            # try both F1 and E2 results sheets in priority
+            candidates = ["F1 Results", "E2 Results", "F1 results", "E2 results"]
+            xl = pd.ExcelFile(file_path)
+            sheet_name = None
+            for c in candidates:
+                if c in xl.sheet_names:
+                    sheet_name = c
+                    break
+            if sheet_name is None:
+                # pick any sheet containing 'result'
+                for s in xl.sheet_names:
+                    if 'result' in s.lower():
+                        sheet_name = s
+                        break
+            if sheet_name is None:
+                print(f"⚠️ No F1/E2 results sheet found in {file_path}")
+                return pd.DataFrame()
+        elif lab_type == "Large Mass":
+            sheet_name = "Results sheet"
+        else:
+            return pd.DataFrame()
+
+        df_raw = pd.read_excel(file_path, sheet_name=sheet_name, header=None)
+        header_row = find_header_row(df_raw)
+        if header_row is None:
+            print(f"⚠️ Could not detect header row in {file_path} sheet '{sheet_name}'")
+            return pd.DataFrame()
+        df = pd.read_excel(file_path, sheet_name=sheet_name, header=header_row)
+
+        # debug: show detected headers (raw)
+        raw_cols = list(df.columns)
+        print(f"Detected header row {header_row} in '{os.path.basename(file_path)}' -> raw headers: {raw_cols[:10]}{'...' if len(raw_cols)>10 else ''}")
+
+        # normalise headers
+        new_cols = [normalize_colname(c) for c in df.columns]
+        df.columns = new_cols
+
+        # drop fully empty columns
+        df.dropna(axis=1, how='all', inplace=True)
+
+        # try common renames
+        rename_map = {
+            'nominal': 'nominal_mass',
+            'nominalmass': 'nominal_mass',
+            'nominal_mass_g': 'nominal_mass',
+            'measured': 'measured_mass',
+            'measured_mass_g': 'measured_mass',
+            'conventional': 'conventional_mass',
+            'conventional_mass_g': 'conventional_mass',
+            'uncertainty': 'uncertainty_mg',
+            'uncertaintymg': 'uncertainty_mg',
+            'deviation': 'deviation_mg',
+            'deviationmg': 'deviation_mg',
+            'oiml_class': 'oiml_class',
+            'i.d.no': 'id_no',
+            'idno': 'id_no',
+            'i_d_no': 'id_no',
+            'value': 'value'
+        }
+        df.rename(columns=rename_map, inplace=True)
+
+        # convert numbers where possible
+        for col in df.columns:
+            # attempt numeric conversion for likely numeric cols
+            if any(k in col for k in ('mass','mg','deviation','value','meas','uncertainty','nominal','conventional')):
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+
+        return df
+
+    except Exception as e:
+        print(f"Error reading measurements from {file_path} ({e})")
+        return pd.DataFrame()
+
+# ------------------------
+# Main insertion logic (maps, creates columns, inserts)
+# ------------------------
+def process_and_insert(file_path, engine):
+    """Process a single file and insert metadata + measurements into DB."""
+    print(f"\n=== Processing file: {os.path.basename(file_path)} ===")
+    lab_type = detect_lab_type(file_path)
+    print("Detected lab type:", lab_type)
+
+    # extract metadata
+    # naive metadata extractor - looks at Admin or Input sheet first column key / second column value
+    try:
+        xl = pd.ExcelFile(file_path)
+        if lab_type == "F1/E2":
+            meta_sheet = 'Admin' if 'Admin' in xl.sheet_names else (xl.sheet_names[0] if xl.sheet_names else None)
+        else:
+            meta_sheet = 'Input' if 'Input' in xl.sheet_names else (xl.sheet_names[0] if xl.sheet_names else None)
+        metadata = {}
+        if meta_sheet:
+            df_meta = pd.read_excel(file_path, sheet_name=meta_sheet, header=None)
+            for _, row in df_meta.iterrows():
+                vals = [str(v).strip() for v in row.values if pd.notna(v)]
+                if len(vals) >= 2:
+                    key = normalize_colname(vals[0])
+                    val = vals[1]
+                    metadata[key] = val
+            metadata['file_name'] = os.path.basename(file_path)
+    except Exception as e:
+        print("Warning: metadata extraction failed:", e)
+        metadata = {'file_name': os.path.basename(file_path)}
+
+    # insert metadata & get id
+    try:
+        metadata_id = insert_metadata_return_id(engine, metadata)
+    except Exception as e:
+        print("ERROR inserting metadata:", e)
+        return
+
+    # extract measurement dataframe
+    df = extract_measurements(file_path, lab_type)
+    if df.empty:
+        print("No measurement rows extracted.")
+        return
+
+    # add metadata_id column to df
+    df['metadata_id'] = metadata_id
+
+    # target table
+    table_name = "f1_measurements" if lab_type == "F1/E2" else "large_mass_results"
+
+    # ensure table exists
+    ensure_table_exists(engine, table_name)
+
+    # get DB columns
+    db_cols = get_db_columns(engine, table_name)
+    db_cols_lower = [c.lower() for c in db_cols]
+
+    # build mapping from df columns -> db columns (exact match or fuzzy)
+    mapping = {}
+    created_cols = {}
+    for col in df.columns:
+        norm = normalize_colname(col)
+        # prefer exact match (case-insensitive)
+        if norm in db_cols_lower:
+            # find actual db col name matching lower
+            matched = db_cols[db_cols_lower.index(norm)]
+            mapping[col] = matched
+            continue
+        # fuzzy match
+        candidate = difflib.get_close_matches(norm, db_cols_lower, n=1, cutoff=0.8)
+        if candidate:
+            matched = db_cols[db_cols_lower.index(candidate[0])]
+            mapping[col] = matched
+            continue
+        # not found -> plan to create new column using inferred type
+        dtype = infer_sql_type(df[col])
+        new_col = norm
+        # ensure new_col doesn't collide with existing db columns or created names
+        i = 1
+        while new_col in db_cols_lower or new_col in created_cols:
+            new_col = f"{norm}_{i}"
+            i += 1
+        # add to DB
+        ensure_columns_exist(engine, table_name, {new_col: dtype})
+        # refresh db_cols lists so next matches find it
+        db_cols = get_db_columns(engine, table_name)
+        db_cols_lower = [c.lower() for c in db_cols]
+        mapping[col] = db_cols[db_cols_lower.index(new_col)]
+        created_cols[new_col] = dtype
+
+    # ensure metadata_id column exists in DB table
+    if 'metadata_id' not in [c.lower() for c in get_db_columns(engine, table_name)]:
+        ensure_columns_exist(engine, table_name, {'metadata_id': 'integer'})
+
+    # rename df cols to DB column names
+    rename_dict = {orig: mapping[orig] for orig in mapping}
+    df_renamed = df.rename(columns=rename_dict)
+
+    # final keep only columns that exist in DB
+    final_db_cols = get_db_columns(engine, table_name)
+    keep = [c for c in df_renamed.columns if c in final_db_cols]
+    df_final = df_renamed[keep]
+
+    if df_final.empty:
+        print("After mapping there are no columns to insert. Aborting.")
+        return
+
+    # append to DB
+    try:
+        df_final.to_sql(table_name, con=engine, if_exists='append', index=False)
+        print(f"Inserted {len(df_final)} rows into {table_name} (metadata_id={metadata_id})")
+        if created_cols:
+            print(f"New columns created: {created_cols}")
+    except SQLAlchemyError as e:
+        print("SQLAlchemy error while inserting measurements:", e)
+
+# ------------------------
+# Runner
+# ------------------------
+def run_import(folder_path='.'):
+    engine = create_engine(DB_URL)
+    # verify connection
+    try:
+        with engine.connect() as conn:
+            conn.execute(text('SELECT 1'))
+    except Exception as e:
+        print("ERROR connecting to DB with DB_URL:", DB_URL)
+        print("Exception:", e)
+        return
+
+    files = [f for f in os.listdir(folder_path) if f.lower().endswith('.xlsm') and not f.startswith('~$')]
+    if not files:
+        print("No .xlsm files found in folder:", folder_path)
+        return
+
+    for f in files:
+        path = os.path.join(folder_path, f)
+        process_and_insert(path, engine)
+
+    # final summary counts
+    try:
+        with engine.connect() as conn:
+            for t in ('calibration_metadata','f1_measurements','large_mass_results'):
+                try:
+                    cnt = conn.execute(text(f'SELECT COUNT(*) FROM "{t}"')).scalar()
+                except Exception:
+                    cnt = 'N/A (table missing)'
+                print(f"Table {t}: {cnt}")
+    except Exception:
+        pass
+
+if __name__ == '__main__':
+    run_import(folder_path='.')
